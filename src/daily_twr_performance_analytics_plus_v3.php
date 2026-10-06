@@ -618,13 +618,13 @@ function calculateAdvancedMetrics(array $dailyRows, array $monthlyPeriodReturns,
     ];
 }
 
-function linkedActiveContributions(array $dailyRows, DateTimeImmutable $startDate, bool $requireFullHistory = true): ?array
+function linkedActiveContributions(array $dailyRows, string $startDate, bool $requireFullHistory = true): ?array
 {
     if ($dailyRows === []) {
         return null;
     }
-    $firstDate = new DateTimeImmutable($dailyRows[0]['date']);
-    if ($requireFullHistory && $firstDate > $startDate) {
+    // Dates are Y-m-d strings, which compare correctly as plain strings.
+    if ($requireFullHistory && $dailyRows[0]['date'] > $startDate) {
         return null;
     }
 
@@ -637,8 +637,7 @@ function linkedActiveContributions(array $dailyRows, DateTimeImmutable $startDat
     $actualEnd = null;
 
     foreach ($dailyRows as $row) {
-        $date = new DateTimeImmutable($row['date']);
-        if ($date < $startDate) {
+        if ($row['date'] < $startDate) {
             continue;
         }
         $rp = $row['daily_return'] ?? null;
@@ -774,28 +773,66 @@ function linkedActiveContributions(array $dailyRows, DateTimeImmutable $startDat
     ];
 }
 
-function periodReturn(array $dailyRows, DateTimeImmutable $startDate, string $returnKey = 'daily_return', bool $requireFullHistory = true): ?float
+/**
+ * Cumulative growth after each daily row. Any period ending on the last row is
+ * then a ratio of two entries instead of a fresh pass over the whole history.
+ */
+function buildGrowthIndex(array $dailyRows, string $returnKey): array
 {
-    if ($dailyRows === []) {
-        return null;
-    }
-
-    $firstDate = new DateTimeImmutable($dailyRows[0]['date']);
-    if ($requireFullHistory && $firstDate > $startDate) {
-        return null;
-    }
-
+    $dates = [];
     $returns = [];
+    $growth = [];
+    $observations = [];
+    $runningGrowth = 1.0;
+    $runningCount = 0;
+
     foreach ($dailyRows as $row) {
-        if (new DateTimeImmutable($row['date']) >= $startDate) {
-            $value = $row[$returnKey] ?? null;
-            if ($value !== null && is_finite((float)$value)) {
-                $returns[] = (float)$value;
-            }
+        $value = $row[$returnKey] ?? null;
+        $value = ($value !== null && is_finite((float)$value)) ? (float)$value : null;
+        if ($value !== null) {
+            $runningGrowth *= 1.0 + $value;
+            $runningCount++;
         }
+        $dates[] = $row['date'];
+        $returns[] = $value;
+        $growth[] = $runningGrowth;
+        $observations[] = $runningCount;
     }
 
-    return $returns === [] ? null : chainReturns($returns);
+    return ['dates' => $dates, 'returns' => $returns, 'growth' => $growth, 'observations' => $observations];
+}
+
+/**
+ * Chained return from $startDate (inclusive) through the last row.
+ */
+function periodReturn(array $growthIndex, string $startDate, bool $requireFullHistory = true): ?float
+{
+    $dates = $growthIndex['dates'];
+    if ($dates === []) {
+        return null;
+    }
+    if ($requireFullHistory && $dates[0] > $startDate) {
+        return null;
+    }
+
+    $first = firstIndexOnOrAfter($dates, $startDate);
+    if ($first === null) {
+        return null;
+    }
+
+    $last = count($dates) - 1;
+    $baseCount = $first > 0 ? $growthIndex['observations'][$first - 1] : 0;
+    if ($growthIndex['observations'][$last] === $baseCount) {
+        return null;
+    }
+
+    $baseGrowth = $first > 0 ? $growthIndex['growth'][$first - 1] : 1.0;
+    if (abs($baseGrowth) < EPSILON) {
+        // A -100% day before the window makes the ratio undefined; chain directly.
+        return chainReturns(array_slice($growthIndex['returns'], $first));
+    }
+
+    return ($growthIndex['growth'][$last] / $baseGrowth) - 1.0;
 }
 
 /**
@@ -840,12 +877,11 @@ function bucketPeriodReturns(array $dailyRows, string $bucketType): array
     $benchmarkBuckets = [];
 
     foreach ($dailyRows as $row) {
-        $date = new DateTimeImmutable($row['date']);
         if ($bucketType === 'quarter') {
-            $quarter = intdiv(((int)$date->format('n')) - 1, 3) + 1;
-            $bucket = $date->format('Y') . '-Q' . $quarter;
+            $quarter = intdiv((int)substr($row['date'], 5, 2) - 1, 3) + 1;
+            $bucket = substr($row['date'], 0, 4) . '-Q' . $quarter;
         } else {
-            $bucket = $date->format('Y-m');
+            $bucket = substr($row['date'], 0, 7);
         }
 
         if ($row['daily_return'] !== null && is_finite((float)$row['daily_return'])) {
@@ -874,16 +910,16 @@ function bucketPeriodReturns(array $dailyRows, string $bucketType): array
     return $result;
 }
 
-function nearestTradingDateOnOrAfter(array $calendarDates, string $date): ?string
+function firstIndexOnOrAfter(array $sortedDates, string $date): ?int
 {
     $low = 0;
-    $high = count($calendarDates) - 1;
+    $high = count($sortedDates) - 1;
     $answer = null;
 
     while ($low <= $high) {
         $mid = intdiv($low + $high, 2);
-        if ($calendarDates[$mid] >= $date) {
-            $answer = $calendarDates[$mid];
+        if ($sortedDates[$mid] >= $date) {
+            $answer = $mid;
             $high = $mid - 1;
         } else {
             $low = $mid + 1;
@@ -891,6 +927,12 @@ function nearestTradingDateOnOrAfter(array $calendarDates, string $date): ?strin
     }
 
     return $answer;
+}
+
+function nearestTradingDateOnOrAfter(array $calendarDates, string $date): ?string
+{
+    $index = firstIndexOnOrAfter($calendarDates, $date);
+    return $index === null ? null : $calendarDates[$index];
 }
 
 // -----------------------------------------------------------------------------
@@ -1763,11 +1805,13 @@ function calculatePerformance(
         '5 Year' => $lastDate->modify('-5 years'),
         'Since Inception' => $firstDate,
     ];
+    $portfolioIndex = buildGrowthIndex($dailyRows, 'daily_return');
+    $benchmarkIndex = buildGrowthIndex($dailyRows, 'benchmark_daily_return');
     $trailingReturns = [];
     foreach ($periods as $label => $startDate) {
         $requireFullHistory = $label !== 'Since Inception';
-        $portfolioCumulative = periodReturn($dailyRows, $startDate, 'daily_return', $requireFullHistory);
-        $benchmarkCumulative = periodReturn($dailyRows, $startDate, 'benchmark_daily_return', $requireFullHistory);
+        $portfolioCumulative = periodReturn($portfolioIndex, $startDate->format('Y-m-d'), $requireFullHistory);
+        $benchmarkCumulative = periodReturn($benchmarkIndex, $startDate->format('Y-m-d'), $requireFullHistory);
         $portfolioPresented = returnForPresentation($portfolioCumulative, $startDate, $lastDate);
         $benchmarkPresented = returnForPresentation($benchmarkCumulative, $startDate, $lastDate);
 
@@ -1789,7 +1833,7 @@ function calculatePerformance(
     foreach ($periods as $label => $startDate) {
         $activeContributionPeriods[$label] = linkedActiveContributions(
             $dailyRows,
-            $startDate,
+            $startDate->format('Y-m-d'),
             $label !== 'Since Inception'
         );
     }
@@ -2035,8 +2079,20 @@ if ($result !== null) {
             static fn($row) => $row['active'] !== null ? round((float)$row['active'] * 100, 4) : null,
             array_values($result['quarterly_period_returns'])
         ),
-        'activeContributionPeriods' => $result['active_contribution_periods'],
     ];
+    // Only the columns the CSV download needs; the per-holding daily maps stay server-side.
+    $csvRows = array_map(static fn($row) => [
+        $row['date'],
+        round((float)$row['account_value'], 2),
+        round((float)$row['market_value'], 2),
+        round((float)$row['cash'], 2),
+        round((float)$row['external_flow'], 2),
+        $row['daily_return'],
+        $row['cumulative_return'],
+        $row['drawdown'],
+        $row['benchmark_daily_return'],
+        $row['benchmark_cumulative_return'],
+    ], $result['daily_rows']);
     $dailyTableRows = array_slice(array_reverse($result['daily_rows']), 0, 250);
 }
 ?>
@@ -2745,7 +2801,7 @@ if ($result !== null) {
 <?php if ($result !== null && $chartData !== null): ?>
 <script>
 const chartData = <?= json_encode($chartData, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
-const dailyRows = <?= json_encode($result['daily_rows'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
+const csvRows = <?= json_encode($csvRows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
 const benchmarkName = <?= json_encode($result['benchmark'], JSON_THROW_ON_ERROR) ?>;
 const activeContributionPeriods = <?= json_encode($result['active_contribution_periods'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) ?>;
 
@@ -3022,19 +3078,8 @@ document.querySelector('#downloadCsv')?.addEventListener('click', () => {
     ];
     const lines = [headers.map(csvCell).join(',')];
 
-    for (const row of dailyRows) {
-        lines.push([
-            row.date,
-            row.account_value,
-            row.market_value,
-            row.cash,
-            row.external_flow,
-            row.daily_return,
-            row.cumulative_return,
-            row.drawdown,
-            row.benchmark_daily_return,
-            row.benchmark_cumulative_return
-        ].map(csvCell).join(','));
+    for (const row of csvRows) {
+        lines.push(row.map(csvCell).join(','));
     }
 
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
