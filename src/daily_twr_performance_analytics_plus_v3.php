@@ -25,6 +25,9 @@
  *   PORTFOLIOSIGHT_DB_DSN
  *   PORTFOLIOSIGHT_DB_USER
  *   PORTFOLIOSIGHT_DB_PASSWORD
+ *   PORTFOLIOSIGHT_DATA_DIR   Folder holding the optional default CSVs. Keep it
+ *                             outside the web root; defaults to this file's
+ *                             parent directory.
  */
 
 declare(strict_types=1);
@@ -45,11 +48,14 @@ const EPSILON = 0.000001;
 
 $dbDsn = getenv('PORTFOLIOSIGHT_DB_DSN') ?: 'pgsql:host=localhost;port=5432;dbname=admin_portfolio';
 $dsnContainsUser = preg_match('/(?:^|;)user=/i', $dbDsn) === 1;
-$dsnContainsPassword = preg_match('/(?:^|;)password=/i', $dbDsn) === 1;
 $dbUserEnv = getenv('PORTFOLIOSIGHT_DB_USER');
 $dbPasswordEnv = getenv('PORTFOLIOSIGHT_DB_PASSWORD');
 $dbUser = $dbUserEnv !== false ? $dbUserEnv : ($dsnContainsUser ? '' : 'admin_main');
-$dbPassword = /*$dbPasswordEnv !== false ? $dbPasswordEnv : ($dsnContainsPassword ? '' : '')*/ 'MY_PASSWORD';
+$dbPassword = $dbPasswordEnv !== false ? $dbPasswordEnv : '';
+
+// Brokerage exports contain account data, so the default CSVs must not live in
+// a web-served directory where they could be downloaded by URL.
+$dataDir = getenv('PORTFOLIOSIGHT_DATA_DIR') ?: dirname(__DIR__);
 
 // Reuse PortfolioSight authentication when this page lives inside the main app.
 // The page still works standalone; in that case a persistent browser ID is used.
@@ -119,6 +125,17 @@ function csrfToken(): string
         $_SESSION['ps_twr_csrf'] = bin2hex(random_bytes(24));
     }
     return $_SESSION['ps_twr_csrf'];
+}
+
+function userFacingError(Throwable $exception): string
+{
+    // RuntimeExceptions carry messages written for the user. Anything else
+    // (PDO, JSON, ...) may expose connection details or SQL, so log it instead.
+    if ($exception instanceof RuntimeException && !$exception instanceof PDOException) {
+        return $exception->getMessage();
+    }
+    error_log('PortfolioSight TWR: ' . $exception);
+    return 'An unexpected server error occurred. Details were written to the server log.';
 }
 
 function requireValidCsrf(): void
@@ -273,7 +290,7 @@ function inferAsOfDate(string $positionsFilename, string $transactionsFilename):
     return null;
 }
 
-function uploadedOrDefaultPath(string $fieldName, string $defaultFilename): ?string
+function uploadedOrDefaultPath(string $fieldName, string $defaultFilename, string $dataDir): ?string
 {
     if (isset($_FILES[$fieldName]) && is_array($_FILES[$fieldName])) {
         $upload = $_FILES[$fieldName];
@@ -298,7 +315,7 @@ function uploadedOrDefaultPath(string $fieldName, string $defaultFilename): ?str
         }
     }
 
-    $defaultPath = __DIR__ . DIRECTORY_SEPARATOR . $defaultFilename;
+    $defaultPath = $dataDir . DIRECTORY_SEPARATOR . $defaultFilename;
     return is_file($defaultPath) ? $defaultPath : null;
 }
 
@@ -1094,6 +1111,13 @@ function saveUserDataset(
 
 function listUserDatasets(PDO $pdo, string $userId): array
 {
+    // The table is created on first save, so a missing table just means
+    // nothing has been saved yet.
+    $exists = $pdo->query("SELECT to_regclass('user_transactions') IS NOT NULL")->fetchColumn();
+    if (!$exists) {
+        return [];
+    }
+
     $statement = $pdo->prepare(
         'SELECT id, dataset_name, as_of_date, report_start_date, benchmark_ticker,
                 risk_free_rate_pct, positions_filename, transactions_filename,
@@ -1857,8 +1881,8 @@ $csrf = csrfToken();
 
 $isPost = ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST';
 $formAction = (string)($_POST['form_action'] ?? 'calculate');
-$defaultFilesExist = is_file(__DIR__ . DIRECTORY_SEPARATOR . DEFAULT_POSITIONS_FILE)
-    && is_file(__DIR__ . DIRECTORY_SEPARATOR . DEFAULT_TRANSACTIONS_FILE);
+$defaultFilesExist = is_file($dataDir . DIRECTORY_SEPARATOR . DEFAULT_POSITIONS_FILE)
+    && is_file($dataDir . DIRECTORY_SEPARATOR . DEFAULT_TRANSACTIONS_FILE);
 
 $positionsFilename = uploadedOrDefaultName('positions_csv', DEFAULT_POSITIONS_FILE);
 $transactionsFilename = uploadedOrDefaultName('transactions_csv', DEFAULT_TRANSACTIONS_FILE);
@@ -1877,10 +1901,10 @@ $pdo = null;
 $priceSchema = null;
 try {
     $pdo = connectDatabase($dbDsn, $dbUser, $dbPassword);
-    ensureUserTransactionsTable($pdo);
     $savedDatasets = listUserDatasets($pdo, $currentUserId);
 } catch (Throwable $exception) {
-    $errors[] = 'Database setup error: ' . $exception->getMessage();
+    error_log('PortfolioSight TWR database setup: ' . $exception);
+    $errors[] = 'Could not connect to the database. Details were written to the server log.';
 }
 
 if ($isPost && $formAction === 'delete_saved' && $pdo !== null) {
@@ -1894,7 +1918,7 @@ if ($isPost && $formAction === 'delete_saved' && $pdo !== null) {
         $savedDatasets = listUserDatasets($pdo, $currentUserId);
         $notices[] = 'Saved dataset deleted.';
     } catch (Throwable $exception) {
-        $errors[] = $exception->getMessage();
+        $errors[] = userFacingError($exception);
     }
 }
 
@@ -1925,15 +1949,16 @@ if ($isPost && $formAction === 'load_saved' && $pdo !== null) {
         $shouldRun = true;
         $notices[] = 'Loaded saved dataset: ' . $loadedDatasetName;
     } catch (Throwable $exception) {
-        $errors[] = $exception->getMessage();
+        $errors[] = userFacingError($exception);
     }
 } elseif ($formAction !== 'delete_saved') {
-    $shouldRun = ($isPost && in_array($formAction, ['calculate', 'calculate_save'], true)) || (!$isPost && $defaultFilesExist);
+    $shouldRun = $isPost && in_array($formAction, ['calculate', 'calculate_save'], true);
     $saveAfterCalculation = $isPost && $formAction === 'calculate_save';
 }
 
 if ($shouldRun && $pdo !== null) {
     try {
+        requireValidCsrf();
         $asOf = DateTimeImmutable::createFromFormat('!Y-m-d', $asOfDate);
         if ($asOf === false) {
             throw new RuntimeException('Enter a valid as-of date.');
@@ -1943,8 +1968,8 @@ if ($shouldRun && $pdo !== null) {
         }
 
         if ($positionsSummary === null || $transactionsSummary === null) {
-            $positionsPath = uploadedOrDefaultPath('positions_csv', DEFAULT_POSITIONS_FILE);
-            $transactionsPath = uploadedOrDefaultPath('transactions_csv', DEFAULT_TRANSACTIONS_FILE);
+            $positionsPath = uploadedOrDefaultPath('positions_csv', DEFAULT_POSITIONS_FILE, $dataDir);
+            $transactionsPath = uploadedOrDefaultPath('transactions_csv', DEFAULT_TRANSACTIONS_FILE, $dataDir);
 
             if ($positionsPath === null || $transactionsPath === null) {
                 throw new RuntimeException('Upload both the current positions CSV and the transactions CSV, or load a saved dataset.');
@@ -1968,6 +1993,7 @@ if ($shouldRun && $pdo !== null) {
         );
 
         if ($saveAfterCalculation) {
+            ensureUserTransactionsTable($pdo);
             $savedId = saveUserDataset(
                 $pdo,
                 $currentUserId,
@@ -1986,7 +2012,7 @@ if ($shouldRun && $pdo !== null) {
             $notices[] = 'Saved this upload for later as dataset #' . $savedId . '.';
         }
     } catch (Throwable $exception) {
-        $errors[] = $exception->getMessage();
+        $errors[] = userFacingError($exception);
     }
 }
 
@@ -2329,7 +2355,7 @@ if ($result !== null) {
                     </div>
                     <p class="form-help">
                         <strong>Calculate &amp; save</strong> stores the parsed positions, transaction history, and methodology settings in PostgreSQL so the same dataset can be reopened without uploading the CSVs again. Default external-flow treatment is <strong>MoneyLink Transfer only</strong>.
-                        <?php if ($defaultFilesExist): ?> The two named CSV files were also found beside this PHP file and can be used without uploading replacements.<?php endif; ?>
+                        <?php if ($defaultFilesExist): ?> The two default CSV files were found in the data directory and are used for any file you don't upload.<?php endif; ?>
                     </p>
                     <?php if ($loadedDatasetName !== null): ?>
                         <div class="loaded-note">Currently viewing saved dataset: <strong><?= h($loadedDatasetName) ?></strong></div>
