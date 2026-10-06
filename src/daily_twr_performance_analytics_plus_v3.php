@@ -618,7 +618,7 @@ function calculateAdvancedMetrics(array $dailyRows, array $monthlyPeriodReturns,
     ];
 }
 
-function linkedActiveContributions(array $dailyRows, string $startDate, bool $requireFullHistory = true): ?array
+function linkedActiveContributions(array $dailyRows, string $startDate, string $firstIncludedDate, bool $requireFullHistory = true): ?array
 {
     if ($dailyRows === []) {
         return null;
@@ -637,7 +637,7 @@ function linkedActiveContributions(array $dailyRows, string $startDate, bool $re
     $actualEnd = null;
 
     foreach ($dailyRows as $row) {
-        if ($row['date'] < $startDate) {
+        if ($row['date'] < $firstIncludedDate) {
             continue;
         }
         $rp = $row['daily_return'] ?? null;
@@ -803,9 +803,10 @@ function buildGrowthIndex(array $dailyRows, string $returnKey): array
 }
 
 /**
- * Chained return from $startDate (inclusive) through the last row.
+ * Chained return from $firstIncludedDate (inclusive) through the last row.
+ * $startDate is the period's nominal start, used for the full-history check.
  */
-function periodReturn(array $growthIndex, string $startDate, bool $requireFullHistory = true): ?float
+function periodReturn(array $growthIndex, string $startDate, string $firstIncludedDate, bool $requireFullHistory = true): ?float
 {
     $dates = $growthIndex['dates'];
     if ($dates === []) {
@@ -815,7 +816,7 @@ function periodReturn(array $growthIndex, string $startDate, bool $requireFullHi
         return null;
     }
 
-    $first = firstIndexOnOrAfter($dates, $startDate);
+    $first = firstIndexOnOrAfter($dates, $firstIncludedDate);
     if ($first === null) {
         return null;
     }
@@ -1805,13 +1806,25 @@ function calculatePerformance(
         '5 Year' => $lastDate->modify('-5 years'),
         'Since Inception' => $firstDate,
     ];
+    // Trailing windows run from the close of their anchor date, so the anchor
+    // day's own return belongs to the previous window. MTD, YTD and since
+    // inception start on a calendar boundary whose first day is included.
+    $trailingWindowLabels = ['3 Months', '6 Months', '1 Year', '3 Year', '5 Year'];
+    $firstIncludedDates = [];
+    foreach ($periods as $label => $startDate) {
+        $firstIncludedDates[$label] = in_array($label, $trailingWindowLabels, true)
+            ? $startDate->modify('+1 day')->format('Y-m-d')
+            : $startDate->format('Y-m-d');
+    }
+
     $portfolioIndex = buildGrowthIndex($dailyRows, 'daily_return');
     $benchmarkIndex = buildGrowthIndex($dailyRows, 'benchmark_daily_return');
     $trailingReturns = [];
     foreach ($periods as $label => $startDate) {
         $requireFullHistory = $label !== 'Since Inception';
-        $portfolioCumulative = periodReturn($portfolioIndex, $startDate->format('Y-m-d'), $requireFullHistory);
-        $benchmarkCumulative = periodReturn($benchmarkIndex, $startDate->format('Y-m-d'), $requireFullHistory);
+        $start = $startDate->format('Y-m-d');
+        $portfolioCumulative = periodReturn($portfolioIndex, $start, $firstIncludedDates[$label], $requireFullHistory);
+        $benchmarkCumulative = periodReturn($benchmarkIndex, $start, $firstIncludedDates[$label], $requireFullHistory);
         $portfolioPresented = returnForPresentation($portfolioCumulative, $startDate, $lastDate);
         $benchmarkPresented = returnForPresentation($benchmarkCumulative, $startDate, $lastDate);
 
@@ -1834,6 +1847,7 @@ function calculatePerformance(
         $activeContributionPeriods[$label] = linkedActiveContributions(
             $dailyRows,
             $startDate->format('Y-m-d'),
+            $firstIncludedDates[$label],
             $label !== 'Since Inception'
         );
     }
