@@ -618,15 +618,38 @@ function calculateAdvancedMetrics(array $dailyRows, array $monthlyPeriodReturns,
     ];
 }
 
-function linkedActiveContributions(array $dailyRows, string $startDate, string $firstIncludedDate, bool $requireFullHistory = true): ?array
+/**
+ * Linked active contribution for every report period in one backward pass.
+ *
+ * Every period ends on the last row, so the linked effect of a holding for a
+ * window starting on used day m satisfies
+ *
+ *   E(m) = a(m) * B(after m) + (1 + rp(m)) * E(m + 1)
+ *
+ * where a is the holding's daily active contribution and B(after m) is the
+ * benchmark growth over the used days after m. This is the same geometric
+ * linking as walking each window forward (earlier days' effects compound with
+ * later benchmark returns, later days' effects scale with earlier portfolio
+ * growth), so walking backward once and snapshotting the state as each window
+ * opens gives every period without re-scanning the history per period.
+ *
+ * $periodWindows: label => ['start' => Y-m-d, 'first_included' => Y-m-d,
+ *                           'require_full_history' => bool]
+ */
+function linkedActiveContributionsByPeriod(array $dailyRows, array $periodWindows): array
 {
+    $results = array_fill_keys(array_keys($periodWindows), null);
     if ($dailyRows === []) {
-        return null;
+        return $results;
     }
+
     // Dates are Y-m-d strings, which compare correctly as plain strings.
-    if ($requireFullHistory && $dailyRows[0]['date'] > $startDate) {
-        return null;
-    }
+    $pending = array_filter(
+        $periodWindows,
+        static fn($window) => !$window['require_full_history'] || $dailyRows[0]['date'] <= $window['start']
+    );
+    // Latest window first: it is the first one complete while walking backward.
+    uasort($pending, static fn($a, $b) => strcmp($b['first_included'], $a['first_included']));
 
     $effects = [];
     $detailStats = [];
@@ -636,10 +659,23 @@ function linkedActiveContributions(array $dailyRows, string $startDate, string $
     $actualStart = null;
     $actualEnd = null;
 
-    foreach ($dailyRows as $row) {
-        if ($row['date'] < $firstIncludedDate) {
-            continue;
+    for ($i = count($dailyRows) - 1; $i >= -1; $i--) {
+        $row = $i >= 0 ? $dailyRows[$i] : null;
+
+        // Every window opening after this row now has all of its days.
+        foreach ($pending as $label => $window) {
+            if ($row !== null && $window['first_included'] <= $row['date']) {
+                break;
+            }
+            $results[$label] = finishLinkedActiveContributions(
+                $effects, $detailStats, $portfolioGrowth, $benchmarkGrowth, $used, $actualStart, $actualEnd
+            );
+            unset($pending[$label]);
         }
+        if ($row === null || $pending === []) {
+            break;
+        }
+
         $rp = $row['daily_return'] ?? null;
         $rb = $row['benchmark_daily_return'] ?? null;
         $activeMap = $row['active_contributions'] ?? null;
@@ -650,13 +686,13 @@ function linkedActiveContributions(array $dailyRows, string $startDate, string $
         // Geometrically link each holding's daily active effect so the total
         // reconciles to cumulative portfolio return minus cumulative benchmark return.
         foreach ($effects as $bucket => $value) {
-            $effects[$bucket] = $value * (1.0 + (float)$rb);
+            $effects[$bucket] = $value * (1.0 + (float)$rp);
         }
         foreach ($activeMap as $bucket => $dailyActiveContribution) {
             if (!is_finite((float)$dailyActiveContribution)) {
                 continue;
             }
-            $effects[$bucket] = ($effects[$bucket] ?? 0.0) + $portfolioGrowth * (float)$dailyActiveContribution;
+            $effects[$bucket] = ($effects[$bucket] ?? 0.0) + $benchmarkGrowth * (float)$dailyActiveContribution;
         }
 
         // Supporting diagnostics for interpretation.  These do NOT drive the
@@ -666,11 +702,7 @@ function linkedActiveContributions(array $dailyRows, string $startDate, string $
         // over those same exposed market days?
         $contributions = is_array($row['contributions'] ?? null) ? $row['contributions'] : [];
         $beginningWeights = is_array($row['beginning_weights'] ?? null) ? $row['beginning_weights'] : [];
-        $detailBuckets = array_unique(array_merge(
-            array_keys($activeMap),
-            array_keys($contributions),
-            array_keys($beginningWeights)
-        ));
+        $detailBuckets = array_keys($activeMap + $contributions + $beginningWeights);
 
         foreach ($detailBuckets as $bucket) {
             if (!isset($detailStats[$bucket])) {
@@ -699,8 +731,9 @@ function linkedActiveContributions(array $dailyRows, string $startDate, string $
                     $detailStats[$bucket]['holding_growth'] *= 1.0 + $holdingDailyReturn;
                     $detailStats[$bucket]['benchmark_held_growth'] *= 1.0 + (float)$rb;
                     $detailStats[$bucket]['exposure_days']++;
-                    $detailStats[$bucket]['first_exposure_date'] ??= $row['date'];
-                    $detailStats[$bucket]['last_exposure_date'] = $row['date'];
+                    // Walking backward, the last date seen is the earliest.
+                    $detailStats[$bucket]['first_exposure_date'] = $row['date'];
+                    $detailStats[$bucket]['last_exposure_date'] ??= $row['date'];
                 }
             }
         }
@@ -708,10 +741,22 @@ function linkedActiveContributions(array $dailyRows, string $startDate, string $
         $portfolioGrowth *= 1.0 + (float)$rp;
         $benchmarkGrowth *= 1.0 + (float)$rb;
         $used++;
-        $actualStart ??= $row['date'];
-        $actualEnd = $row['date'];
+        $actualStart = $row['date'];
+        $actualEnd ??= $row['date'];
     }
 
+    return $results;
+}
+
+function finishLinkedActiveContributions(
+    array $effects,
+    array $detailStats,
+    float $portfolioGrowth,
+    float $benchmarkGrowth,
+    int $used,
+    ?string $actualStart,
+    ?string $actualEnd
+): ?array {
     if ($used === 0) {
         return null;
     }
@@ -1842,15 +1887,15 @@ function calculatePerformance(
     $quarterlyPeriodReturns = bucketPeriodReturns($dailyRows, 'quarter');
     $advancedMetrics = calculateAdvancedMetrics($dailyRows, $monthlyPeriodReturns, $riskFreeAnnual);
 
-    $activeContributionPeriods = [];
+    $periodWindows = [];
     foreach ($periods as $label => $startDate) {
-        $activeContributionPeriods[$label] = linkedActiveContributions(
-            $dailyRows,
-            $startDate->format('Y-m-d'),
-            $firstIncludedDates[$label],
-            $label !== 'Since Inception'
-        );
+        $periodWindows[$label] = [
+            'start' => $startDate->format('Y-m-d'),
+            'first_included' => $firstIncludedDates[$label],
+            'require_full_history' => $label !== 'Since Inception',
+        ];
     }
+    $activeContributionPeriods = linkedActiveContributionsByPeriod($dailyRows, $periodWindows);
 
     $monthlyReturns = [];
     $annual = [];
