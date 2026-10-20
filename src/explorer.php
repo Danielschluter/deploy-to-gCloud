@@ -24,6 +24,7 @@ page_header('Explorer', 'explorer');
 .tab-btn.active{color:var(--accent);border-bottom-color:var(--accent)}
 .tab-pn{flex:1;overflow:auto;display:none}
 .tab-pn.active{display:block}
+#tp-data.active{display:flex;flex-direction:column}
 .tab-pn::-webkit-scrollbar{width:6px;height:6px}
 .tab-pn::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
 
@@ -66,7 +67,7 @@ page_header('Explorer', 'explorer');
             <div id="col-wrap"><div style="padding:24px;text-align:center;color:var(--text3)"><div class="spinner" style="margin:0 auto 8px"></div>Loading…</div></div>
         </div>
 
-        <div class="tab-pn" id="tp-data" style="display:flex;flex-direction:column">
+        <div class="tab-pn" id="tp-data">
             <div class="data-toolbar">
                 <input type="text" id="data-search" placeholder="Search all columns…" class="form-inp" style="padding:5px 10px;font-size:12px;width:220px" oninput="debounce(()=>loadData(1),350)">
                 <select id="data-perpage" onchange="loadData(1)" class="form-inp" style="padding:5px 8px;font-size:12px;width:auto">
@@ -230,8 +231,7 @@ function switchTab(tab, id) {
     tab.classList.add('active');
     const panel = document.getElementById('tp-'+id);
     panel.classList.add('active');
-    panel.style.display = id==='data' ? 'flex' : '';
-    if (id==='data') { panel.style.flexDirection='column'; if (!document.getElementById('data-body').querySelector('table')) loadData(1); }
+    if (id==='data' && !document.getElementById('data-body').querySelector('table')) loadData(1);
 }
 
 function queryTable() { sessionStorage.setItem('pgclient_sql', `SELECT *\nFROM "${SCHEMA}"."${TABLE}"\nLIMIT 100;`); location.href='editor.php'; }
