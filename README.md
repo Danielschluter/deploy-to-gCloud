@@ -49,7 +49,9 @@ The script prints the URL and the PGClient login. The production setup differs f
 - Postgres is not exposed outside the VM, and its password is random.
 - Credentials live in `/opt/app/.env` on the VM. To change the PGClient login, edit
   `ADMIN_USER`/`ADMIN_PASSWORD` there and re-run the script.
-- Uploads are allowed up to 20 MB.
+- CSV uploads are allowed up to 100 MB (about a million rows in roughly 75 seconds). To change
+  it, edit `client_max_body_size` in `nginx/nginx.prod.conf` and `upload_max_filesize` /
+  `post_max_size` in `php/uploads.ini` to the same value, then re-run the deploy script.
 
 The site is served over plain HTTP, so the login is sent unencrypted. For HTTPS, point a
 domain at the VM's IP and put a TLS-terminating proxy (e.g. Caddy) or a Google Cloud load

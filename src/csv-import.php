@@ -19,20 +19,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
     } else {
         try {
             $pdo = get_db();
-            $rows = []; $headers = [];
 
-            if (($handle = fopen($file['tmp_name'], 'r')) !== false) {
-                $rn = 0;
-                while (($data = fgetcsv($handle, 10000, ',')) !== false) {
-                    if ($rn === 0) $headers = $data;
-                    else $rows[] = $data;
-                    $rn++;
-                }
-                fclose($handle);
-            }
-
+            if (($handle = fopen($file['tmp_name'], 'r')) === false) throw new Exception('Could not read the uploaded file');
+            $headers = fgetcsv($handle, 0, ',');
             if (empty($headers)) throw new Exception('CSV file is empty or has no headers');
-            if (empty($rows)) throw new Exception('CSV file has no data rows');
+
+            // Rows are inserted while reading, so only this sample is held in memory.
+            $sample = [];
+            while (count($sample) < 10 && ($data = fgetcsv($handle, 0, ',')) !== false) $sample[] = $data;
+            if (empty($sample)) throw new Exception('CSV file has no data rows');
 
             $clean_headers = array_map(fn($h) => preg_replace('/[^a-zA-Z0-9_]/', '_', trim($h)) ?: 'col', $headers);
 
@@ -40,7 +35,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
             $types = [];
             foreach ($clean_headers as $idx => $hdr) {
                 $types[$hdr] = 'TEXT';
-                $sample = array_slice($rows, 0, min(10, count($rows)));
                 $allNum = true; $allInt = true;
                 foreach ($sample as $row) {
                     $v = trim($row[$idx] ?? '');
@@ -50,6 +44,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                 }
                 if ($allNum) $types[$hdr] = $allInt ? 'INTEGER' : 'DECIMAL(15,2)';
             }
+
+            // One transaction: much faster than committing each row, and a failed
+            // import leaves no partial table behind.
+            $pdo->beginTransaction();
 
             // Check / create table
             $exists = $pdo->prepare("SELECT EXISTS(SELECT FROM information_schema.tables WHERE table_name=?)");
@@ -67,16 +65,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
             $col_list = implode(',', array_map(fn($h)=>"\"$h\"", $clean_headers));
             $stmt = $pdo->prepare("INSERT INTO $table_name ($col_list) VALUES ($ph)");
             $inserted = 0;
-            foreach ($rows as $row) {
+            $insert = function (array $row) use ($stmt, $clean_headers, &$inserted) {
                 $vals = array_map(fn($i) => (trim($row[$i] ?? '') === '') ? null : trim($row[$i] ?? ''), range(0, count($clean_headers)-1));
                 $stmt->execute($vals);
                 $inserted++;
-            }
+            };
+            foreach ($sample as $row) $insert($row);
+            while (($data = fgetcsv($handle, 0, ',')) !== false) $insert($data);
+            $pdo->commit();
+            fclose($handle);
 
             $message = ($created ? "Table '$table_name' created. " : "Using existing table '$table_name'. ") . "Inserted $inserted rows.";
             $messageType = 'success';
             $uploaded_file = ['name' => $file['name'], 'table' => $table_name, 'rows' => $inserted, 'headers' => $clean_headers, 'types' => $types];
         } catch (Exception $e) {
+            if (isset($pdo) && $pdo->inTransaction()) $pdo->rollBack();
             $message = 'Error: ' . $e->getMessage(); $messageType = 'error';
         }
     }
