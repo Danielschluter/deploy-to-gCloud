@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs on the VM as root (called by gcp-deploy.sh). Installs Docker if missing,
-# creates .env and the basic-auth file on first run, then (re)starts the stack.
+# creates .env on first run, (re)starts the stack and writes PGClient's login.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,19 +19,24 @@ if [ ! -f .env ]; then
 POSTGRES_DB=appdb
 POSTGRES_USER=app
 POSTGRES_PASSWORD=$(openssl rand -hex 24)
-BASIC_AUTH_USER=admin
-BASIC_AUTH_PASSWORD=$(openssl rand -hex 12)
+ADMIN_USER=admin
+ADMIN_PASSWORD=$(openssl rand -hex 12)
 EOF
   )
 fi
 
+if ! grep -q '^ADMIN_PASSWORD=' .env; then
+  # .env from a deploy that used nginx basic auth: keep that login for PGClient.
+  . ./.env
+  printf 'ADMIN_USER=%s\nADMIN_PASSWORD=%s\n' \
+    "${BASIC_AUTH_USER:-admin}" "${BASIC_AUTH_PASSWORD:-$(openssl rand -hex 12)}" >> .env
+  sed -i '/^BASIC_AUTH_/d' .env
+fi
+rm -f nginx/.htpasswd
+
 set -a
 . ./.env
 set +a
-
-# Rebuilt every run so editing BASIC_AUTH_* in .env and redeploying takes effect.
-printf '%s:%s\n' "$BASIC_AUTH_USER" "$(openssl passwd -apr1 "$BASIC_AUTH_PASSWORD")" > nginx/.htpasswd
-chmod 644 nginx/.htpasswd
 
 compose() { docker compose -f docker-compose.prod.yml "$@"; }
 
@@ -39,7 +44,11 @@ echo "==> Starting containers"
 compose up -d --build --remove-orphans
 # Restart so the containers pick up the freshly uploaded files and config.
 compose restart php nginx
+
+echo "==> Writing PGClient login"
+compose exec -T -u www-data -e ADMIN_USER="$ADMIN_USER" -e ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+  php php < deploy/pgclient-provision.php
 compose ps
 
 echo
-echo "Login: $BASIC_AUTH_USER / $BASIC_AUTH_PASSWORD  (stored in $(pwd)/.env)"
+echo "PGClient login: $ADMIN_USER / $ADMIN_PASSWORD  (stored in $(pwd)/.env)"

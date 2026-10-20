@@ -90,7 +90,7 @@ for attempt in $(seq 1 30); do
 done
 
 echo "==> Uploading app to $VM_NAME:$APP_DIR"
-COPYFILE_DISABLE=1 tar -czf - --exclude=.env --exclude=nginx/.htpasswd \
+COPYFILE_DISABLE=1 tar -czf - --exclude=.env \
     docker-compose.prod.yml deploy nginx php src \
   | vm_ssh "sudo mkdir -p $APP_DIR && sudo rm -rf $APP_DIR/src && sudo tar -xzf - -C $APP_DIR"
 
@@ -98,5 +98,4 @@ echo "==> Running setup on the VM"
 vm_ssh "sudo bash $APP_DIR/deploy/vm-setup.sh"
 
 echo
-echo "Deployed: http://$IP/"
-echo "Pages:    http://$IP/csv-import.php  http://$IP/view-tables.php"
+echo "Deployed: http://$IP/login.php"

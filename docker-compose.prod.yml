@@ -1,6 +1,6 @@
 # Production stack for a single VM. Used by deploy/vm-setup.sh; reads secrets from .env.
 # Differences from docker-compose.yml: Postgres is not published, credentials come from
-# .env, nginx listens on port 80 behind HTTP basic auth, and containers restart on reboot.
+# .env, nginx listens on port 80, and containers restart on reboot.
 name: php-postgres-app
 
 x-logging: &logging
@@ -21,9 +21,11 @@ services:
     environment:
       <<: *db-env
       DB_HOST: db
+      PGCLIENT_CONFIG_DIR: /var/lib/pgclient
     volumes:
       - ./src:/var/www/html:ro
       - ./php/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+      - pgclient_config:/var/lib/pgclient
     depends_on:
       db:
         condition: service_healthy
@@ -37,7 +39,6 @@ services:
     volumes:
       - ./src:/var/www/html:ro
       - ./nginx/nginx.prod.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
     depends_on:
       - php
     logging: *logging
@@ -57,3 +58,4 @@ services:
 
 volumes:
   db_data:
+  pgclient_config:

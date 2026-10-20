@@ -1,16 +1,23 @@
 <?php
-function get_db() {
-    $host = getenv('DB_HOST') ?: 'db';
-    $port = getenv('DB_PORT') ?: '5432';
-    $db = getenv('POSTGRES_DB') ?: 'appdb';
-    $user = getenv('POSTGRES_USER') ?: 'user';
-    $pass = getenv('POSTGRES_PASSWORD') ?: 'password';
-    $dsn = "pgsql:host={$host};port={$port};dbname={$db}";
+require_once __DIR__ . '/includes/config.php';
+
+function get_db(): PDO {
+    if (session_status() === PHP_SESSION_NONE) {
+        require_once __DIR__ . '/includes/auth.php';
+    }
+
+    $conn = null;
+    if (pgclient_config_exists()) {
+        $conn = pgclient_get_active_connection();
+    }
+
+    if (!$conn) {
+        $conn = pgclient_env_connection();
+    }
+
     try {
-        $pdo = new PDO($dsn, $user, $pass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-        return $pdo;
-    } catch (PDOException $e) {
-        echo "DB connection failed: " . htmlspecialchars($e->getMessage());
-        exit(1);
+        return pgclient_make_pdo($conn);
+    } catch (Throwable $e) {
+        throw new RuntimeException('DB connection failed: ' . $e->getMessage(), 0, $e);
     }
 }

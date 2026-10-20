@@ -1,6 +1,8 @@
-# PHP + PostgreSQL Sample
+# PGClient
 
-This workspace contains a minimal PHP app served by Nginx and PHP-FPM with a PostgreSQL database using Docker Compose.
+A vanilla PHP web client for PostgreSQL (dashboard, SQL editor, schema explorer, table
+viewer, CSV import, multiple connections), served by Nginx and PHP-FPM with a PostgreSQL
+database using Docker Compose.
 
 Quick start:
 
@@ -12,17 +14,16 @@ docker compose up --build
 # Visit http://localhost:8080
 ```
 
-Default DB credentials (set in `docker-compose.yml`):
-- POSTGRES_USER: `user`
-- POSTGRES_PASSWORD: `password`
-- POSTGRES_DB: `appdb`
+On first visit the setup wizard asks for an admin login and a database connection. For the
+bundled database use host `db`, port `5432`, database `appdb`, user `user`, password `password`
+(set in `docker-compose.yml`).
 
 Notes:
 - PHP files are in `src/`.
 - `php/Dockerfile` installs `pdo_pgsql`.
 - Exposed ports: PHP site on `8080`, Postgres on `5432`.
-
-If you want to override DB credentials, create a `.env` file or set environment variables before bringing up the stack.
+- PGClient's login and connections are stored in `pgclient.json` in the `pgclient_config`
+  volume (`PGCLIENT_CONFIG_DIR`), outside the web root.
 
 ## Deploy to a Google Cloud VM
 
@@ -42,15 +43,17 @@ Optional: `ZONE` (default `us-central1-a`), `VM_NAME` (default `php-postgres-app
 `MACHINE_TYPE` (default `e2-small`). If a VM with that name already exists, the script
 deploys onto it.
 
-The script prints the URL and a login. The production setup differs from local dev:
-- The whole site sits behind HTTP basic auth, because the app can create and drop tables.
+The script prints the URL and the PGClient login. The production setup differs from local dev:
+- There is no setup wizard: the deploy writes PGClient's admin login and a "Local PostgreSQL"
+  connection to the bundled database. More connections can be added in the Connections page.
 - Postgres is not exposed outside the VM, and its password is random.
-- Credentials live in `/opt/app/.env` on the VM. To change the login, edit
-  `BASIC_AUTH_USER`/`BASIC_AUTH_PASSWORD` there and re-run the script.
+- Credentials live in `/opt/app/.env` on the VM. To change the PGClient login, edit
+  `ADMIN_USER`/`ADMIN_PASSWORD` there and re-run the script.
 - Uploads are allowed up to 20 MB.
 
-The site is served over plain HTTP. For HTTPS, point a domain at the VM's IP and put a
-TLS-terminating proxy (e.g. Caddy) or a Google Cloud load balancer in front of it.
+The site is served over plain HTTP, so the login is sent unencrypted. For HTTPS, point a
+domain at the VM's IP and put a TLS-terminating proxy (e.g. Caddy) or a Google Cloud load
+balancer in front of it.
 
 Useful commands:
 

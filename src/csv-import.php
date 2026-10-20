@@ -1,5 +1,6 @@
 <?php
 require 'db.php';
+require 'includes/layout.php';
 
 $message = '';
 $messageType = '';
@@ -7,430 +8,217 @@ $uploaded_file = null;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
     $table_name = preg_replace('/[^a-zA-Z0-9_]/', '', $_POST['table_name'] ?? 'imported_data');
-    
-    if (empty($table_name)) {
-        $table_name = 'imported_data';
-    }
-    
+    if (empty($table_name)) $table_name = 'imported_data';
+
     $file = $_FILES['csv_file'];
-    
-    // Validate file upload
+
     if ($file['error'] !== UPLOAD_ERR_OK) {
-        $message = 'File upload error: ' . $file['error'];
-        $messageType = 'error';
-    } elseif ($file['type'] !== 'text/csv' && pathinfo($file['name'], PATHINFO_EXTENSION) !== 'csv') {
-        $message = 'Please upload a valid CSV file';
-        $messageType = 'error';
+        $message = 'Upload error: ' . $file['error']; $messageType = 'error';
+    } elseif (pathinfo($file['name'], PATHINFO_EXTENSION) !== 'csv') {
+        $message = 'Please upload a .csv file'; $messageType = 'error';
     } else {
         try {
             $pdo = get_db();
-            $rows = [];
-            $headers = [];
-            
-            // Read CSV file
+            $rows = []; $headers = [];
+
             if (($handle = fopen($file['tmp_name'], 'r')) !== false) {
-                $row_num = 0;
-                while (($data = fgetcsv($handle, 1000, ',')) !== false) {
-                    if ($row_num === 0) {
-                        $headers = $data;
-                    } else {
-                        $rows[] = $data;
-                    }
-                    $row_num++;
+                $rn = 0;
+                while (($data = fgetcsv($handle, 10000, ',')) !== false) {
+                    if ($rn === 0) $headers = $data;
+                    else $rows[] = $data;
+                    $rn++;
                 }
                 fclose($handle);
             }
-            
-            if (empty($headers)) {
-                throw new Exception('CSV file is empty');
-            }
-            
-            if (empty($rows)) {
-                throw new Exception('CSV file has no data rows');
-            }
-            
-            // Sanitize column names
-            $clean_headers = array_map(function($header) {
-                return preg_replace('/[^a-zA-Z0-9_]/', '_', trim($header));
-            }, $headers);
-            
-            // Infer column types from first few rows
+
+            if (empty($headers)) throw new Exception('CSV file is empty or has no headers');
+            if (empty($rows)) throw new Exception('CSV file has no data rows');
+
+            $clean_headers = array_map(fn($h) => preg_replace('/[^a-zA-Z0-9_]/', '_', trim($h)) ?: 'col', $headers);
+
+            // Infer types
             $types = [];
-            foreach ($clean_headers as $idx => $header) {
-                $types[$header] = 'TEXT'; // Default to TEXT
-                
-                // Check first 10 rows to infer type
-                $sample_rows = array_slice($rows, 0, min(10, count($rows)));
-                $all_numeric = true;
-                $all_integer = true;
-                
-                foreach ($sample_rows as $row) {
-                    $value = trim($row[$idx] ?? '');
-                    if ($value === '') continue;
-                    
-                    if (!is_numeric($value)) {
-                        $all_numeric = false;
-                        $all_integer = false;
-                    } elseif (strpos($value, '.') !== false) {
-                        // Contains a decimal point, so it's not an integer
-                        $all_integer = false;
-                    }
+            foreach ($clean_headers as $idx => $hdr) {
+                $types[$hdr] = 'TEXT';
+                $sample = array_slice($rows, 0, min(10, count($rows)));
+                $allNum = true; $allInt = true;
+                foreach ($sample as $row) {
+                    $v = trim($row[$idx] ?? '');
+                    if ($v === '') continue;
+                    if (!is_numeric($v)) { $allNum = false; $allInt = false; break; }
+                    elseif (strpos($v, '.') !== false) $allInt = false;
                 }
-                
-                if ($all_numeric) {
-                    $types[$header] = $all_integer ? 'INTEGER' : 'DECIMAL(15,2)';
-                }
+                if ($allNum) $types[$hdr] = $allInt ? 'INTEGER' : 'DECIMAL(15,2)';
             }
-            
-            // Check if table exists
-            $table_exists_query = "
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = ?
-                )
-            ";
-            $stmt = $pdo->prepare($table_exists_query);
-            $stmt->execute([$table_name]);
-            $table_exists = $stmt->fetchColumn();
-            
-            // Create table if it doesn't exist
-            if (!$table_exists) {
-                $create_sql = "CREATE TABLE $table_name (id SERIAL PRIMARY KEY";
-                foreach ($clean_headers as $header) {
-                    $create_sql .= ", \"$header\" " . $types[$header];
-                }
-                $create_sql .= ")";
-                
-                $pdo->exec($create_sql);
-                $message = "Table '$table_name' created successfully. ";
+
+            // Check / create table
+            $exists = $pdo->prepare("SELECT EXISTS(SELECT FROM information_schema.tables WHERE table_name=?)");
+            $exists->execute([$table_name]);
+            if (!$exists->fetchColumn()) {
+                $cols_sql = implode(', ', array_map(fn($h) => "\"$h\" " . $types[$h], $clean_headers));
+                $pdo->exec("CREATE TABLE $table_name (id SERIAL PRIMARY KEY, $cols_sql)");
+                $created = true;
             } else {
-                $message = "Inserting data into existing table '$table_name'. ";
+                $created = false;
             }
-            
-            // Insert data
-            $insert_sql = "INSERT INTO $table_name (";
-            $insert_sql .= implode(', ', array_map(fn($h) => "\"$h\"", $clean_headers));
-            $insert_sql .= ") VALUES (";
-            $insert_sql .= implode(', ', array_fill(0, count($clean_headers), '?'));
-            $insert_sql .= ")";
-            
-            $stmt = $pdo->prepare($insert_sql);
-            
+
+            // Insert
+            $ph = implode(',', array_fill(0, count($clean_headers), '?'));
+            $col_list = implode(',', array_map(fn($h)=>"\"$h\"", $clean_headers));
+            $stmt = $pdo->prepare("INSERT INTO $table_name ($col_list) VALUES ($ph)");
             $inserted = 0;
             foreach ($rows as $row) {
-                $values = [];
-                foreach ($clean_headers as $idx => $header) {
-                    $value = trim($row[$idx] ?? '');
-                    $values[] = $value === '' ? null : $value;
-                }
-                $stmt->execute($values);
+                $vals = array_map(fn($i) => (trim($row[$i] ?? '') === '') ? null : trim($row[$i] ?? ''), range(0, count($clean_headers)-1));
+                $stmt->execute($vals);
                 $inserted++;
             }
-            
-            $message .= "Successfully inserted $inserted rows into '$table_name'.";
+
+            $message = ($created ? "Table '$table_name' created. " : "Using existing table '$table_name'. ") . "Inserted $inserted rows.";
             $messageType = 'success';
-            $uploaded_file = [
-                'name' => htmlspecialchars($file['name']),
-                'table' => htmlspecialchars($table_name),
-                'rows' => $inserted,
-                'headers' => $clean_headers
-            ];
-            
+            $uploaded_file = ['name' => $file['name'], 'table' => $table_name, 'rows' => $inserted, 'headers' => $clean_headers, 'types' => $types];
         } catch (Exception $e) {
-            $message = 'Error: ' . htmlspecialchars($e->getMessage());
-            $messageType = 'error';
+            $message = 'Error: ' . $e->getMessage(); $messageType = 'error';
         }
     }
 }
 
-// Fetch existing tables
+// Existing tables
 $existing_tables = [];
 try {
-    $pdo = get_db();
-    $stmt = $pdo->query("
-        SELECT table_name FROM information_schema.tables 
-        WHERE table_schema = 'public' 
+    $pdo2 = get_db();
+    $existing_tables = $pdo2->query("
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema='public' AND table_name NOT LIKE '_sqlclient_%'
         ORDER BY table_name
-    ");
-    $existing_tables = $stmt->fetchAll(PDO::FETCH_COLUMN);
-} catch (Exception $e) {
-    // Silently fail
-}
+    ")->fetchAll(PDO::FETCH_COLUMN);
+} catch (Exception $e) {}
+
+page_header('CSV Import', 'import');
 ?>
-<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>CSV Import</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            /*background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);*/
-            background: #f0f2ff;
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 8px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-            overflow: hidden;
-        }
-        header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 30px;
-            text-align: center;
-        }
-        header h1 {
-            font-size: 28px;
-            margin-bottom: 5px;
-        }
-        header p {
-            opacity: 0.9;
-            font-size: 14px;
-        }
-        .content {
-            padding: 30px;
-        }
-        .alert {
-            padding: 15px 20px;
-            border-radius: 6px;
-            margin-bottom: 20px;
-            font-size: 14px;
-        }
-        .alert.success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-        .alert.error {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 500;
-            color: #333;
-        }
-        input[type="file"],
-        input[type="text"],
-        select {
-            width: 100%;
-            padding: 10px 12px;
-            border: 2px solid #e0e0e0;
-            border-radius: 6px;
-            font-size: 14px;
-            font-family: inherit;
-            transition: border-color 0.3s;
-        }
-        input[type="file"]:focus,
-        input[type="text"]:focus,
-        select:focus {
-            outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-        }
-        .file-label {
-            display: block;
-            padding: 30px;
-            border: 2px dashed #667eea;
-            border-radius: 6px;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.3s;
-            background: #f8f9ff;
-        }
-        .file-label:hover {
-            background: #f0f2ff;
-            border-color: #764ba2;
-        }
-        .file-label input[type="file"] {
-            display: none;
-        }
-        .file-name {
-            font-size: 14px;
-            color: #667eea;
-            margin-top: 8px;
-        }
-        button {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 12px 30px;
-            border: none;
-            border-radius: 6px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
-            width: 100%;
-        }
-        button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
-        }
-        button:active {
-            transform: translateY(0);
-        }
-        .result {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 6px;
-            margin-top: 20px;
-        }
-        .result h3 {
-            color: #333;
-            margin-bottom: 10px;
-        }
-        .result p {
-            color: #666;
-            font-size: 14px;
-            margin-bottom: 5px;
-        }
-        .result table {
-            width: 100%;
-            margin-top: 15px;
-            border-collapse: collapse;
-            font-size: 13px;
-        }
-        .result table th,
-        .result table td {
-            padding: 8px;
-            text-align: left;
-            border-bottom: 1px solid #ddd;
-        }
-        .result table th {
-            background: #e9ecef;
-            font-weight: 600;
-            color: #333;
-        }
-        .tables-section {
-            margin-top: 30px;
-            padding-top: 30px;
-            border-top: 2px solid #e0e0e0;
-        }
-        .tables-section h3 {
-            color: #333;
-            margin-bottom: 15px;
-            font-size: 16px;
-        }
-        .table-list {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-            gap: 10px;
-        }
-        .table-item {
-            background: #f0f2ff;
-            padding: 10px 15px;
-            border-radius: 4px;
-            font-size: 13px;
-            color: #667eea;
-            font-weight: 500;
-            border: 1px solid #d4d9f5;
-        }
-        .empty-state {
-            text-align: center;
-            color: #999;
-            font-size: 14px;
-            padding: 20px;
-        }
-    </style>
-    <script>
-        function handleFileSelect(input) {
-            const fileName = input.files[0]?.name || 'No file selected';
-            const label = input.parentElement.querySelector('.file-name');
-            if (label) {
-                label.textContent = fileName;
-            }
-        }
-    </script>
-  </head>
-  <body>
-    <div class="container">
-      <header>
-        <h1>📊 CSV Database Importer</h1>
-        <p>Upload a CSV file and automatically create/populate database tables</p>
-      </header>
-      
-      <div class="content">
-        <?php if ($message): ?>
-            <div class="alert <?php echo $messageType; ?>">
-                <?php echo $message; ?>
-            </div>
-        <?php endif; ?>
-        
-        <form method="POST" enctype="multipart/form-data">
-          <div class="form-group">
-            <label>Table Name (optional)</label>
-            <input type="text" name="table_name" placeholder="Leave blank for 'imported_data'" value="">
-          </div>
-          
-          <div class="form-group">
-            <label>CSV File</label>
-            <label class="file-label">
-              <input type="file" name="csv_file" accept=".csv" onchange="handleFileSelect(this)" required>
-              <div style="font-size: 14px; color: #667eea; font-weight: 500;">
-                📁 Click to select CSV file or drag & drop
-              </div>
-              <div class="file-name"></div>
-            </label>
-          </div>
-          
-          <button type="submit">Import CSV</button>
-        </form>
-        
-        <?php if ($uploaded_file): ?>
-            <div class="result">
-              <h3>✅ Import Successful</h3>
-              <p><strong>File:</strong> <?php echo $uploaded_file['name']; ?></p>
-              <p><strong>Table:</strong> <?php echo $uploaded_file['table']; ?></p>
-              <p><strong>Rows Inserted:</strong> <?php echo $uploaded_file['rows']; ?></p>
-              <p><strong>Columns:</strong></p>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Column Name</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <?php foreach ($uploaded_file['headers'] as $header): ?>
-                    <tr>
-                      <td><?php echo htmlspecialchars($header); ?></td>
-                    </tr>
-                  <?php endforeach; ?>
-                </tbody>
-              </table>
-            </div>
-        <?php endif; ?>
-        
-        <?php if (!empty($existing_tables)): ?>
-            <div class="tables-section">
-              <h3>📋 Existing Tables</h3>
-              <div class="table-list">
-                <?php foreach ($existing_tables as $table): ?>
-                    <div class="table-item"><?php echo htmlspecialchars($table); ?></div>
-                <?php endforeach; ?>
-              </div>
-            </div>
-        <?php else: ?>
-            <div class="tables-section">
-              <div class="empty-state">No tables created yet. Upload a CSV to get started!</div>
-            </div>
-        <?php endif; ?>
-      </div>
+<style>
+.import-wrap{max-width:760px;margin:0 auto}
+.drop-zone{border:2px dashed var(--border2);border-radius:8px;padding:36px;text-align:center;cursor:pointer;transition:all .2s;background:var(--panel)}
+.drop-zone:hover,.drop-zone.drag-over{border-color:var(--accent);background:var(--accent-bg)}
+.drop-zone input[type=file]{display:none}
+.drop-zone-ico{font-size:32px;margin-bottom:10px}
+.drop-zone-txt{color:var(--text2);font-size:13px}
+.drop-zone-sub{color:var(--text3);font-size:11px;margin-top:4px}
+.file-chosen{color:var(--accent);font-size:12px;margin-top:8px;font-family:monospace}
+</style>
+
+<div class="import-wrap">
+    <?php if ($message): ?>
+    <div class="card" style="margin-bottom:16px;border-color:<?= $messageType==='success'?'var(--green)':'var(--red)' ?>">
+        <div class="card-body" style="color:<?= $messageType==='success'?'var(--green)':'var(--red)' ?>;font-size:13px">
+            <?= $messageType==='success'?'✓':'❌' ?> <?= htmlspecialchars($message) ?>
+        </div>
     </div>
-  </body>
-</html>
+    <?php endif; ?>
+
+    <?php if ($uploaded_file): ?>
+    <div class="card" style="margin-bottom:16px;border-color:var(--green)">
+        <div class="card-hdr" style="color:var(--green)">✓ Import Successful</div>
+        <div class="card-body">
+            <div class="grid g2" style="margin-bottom:12px">
+                <div>
+                    <div class="stat-lbl" style="margin-bottom:4px">File</div>
+                    <div style="font-size:12px"><?= htmlspecialchars($uploaded_file['name']) ?></div>
+                </div>
+                <div>
+                    <div class="stat-lbl" style="margin-bottom:4px">Table</div>
+                    <a href="explorer.php?table=<?= urlencode($uploaded_file['table']) ?>" style="font-size:12px;font-family:monospace">
+                        <?= htmlspecialchars($uploaded_file['table']) ?>
+                    </a>
+                </div>
+                <div>
+                    <div class="stat-lbl" style="margin-bottom:4px">Rows Inserted</div>
+                    <div style="font-size:12px;color:var(--green);font-weight:700"><?= number_format($uploaded_file['rows']) ?></div>
+                </div>
+                <div>
+                    <div class="stat-lbl" style="margin-bottom:4px">Columns</div>
+                    <div style="font-size:12px"><?= count($uploaded_file['headers']) ?></div>
+                </div>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:6px">
+                <?php foreach ($uploaded_file['headers'] as $h): ?>
+                <span class="badge b-blue"><?= htmlspecialchars($h) ?> <span style="opacity:.6;font-size:9px"><?= $uploaded_file['types'][$h] ?></span></span>
+                <?php endforeach; ?>
+            </div>
+            <div style="margin-top:14px;display:flex;gap:8px">
+                <a href="explorer.php?table=<?= urlencode($uploaded_file['table']) ?>" class="btn btn-primary btn-sm">View in Explorer →</a>
+                <a href="view-tables.php?table=<?= urlencode($uploaded_file['table']) ?>" class="btn btn-ghost btn-sm">View Data →</a>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <div class="card" style="margin-bottom:16px">
+        <div class="card-hdr">⬆ Import CSV File</div>
+        <div class="card-body">
+            <form method="POST" enctype="multipart/form-data" id="import-form">
+                <div class="form-group">
+                    <label class="form-lbl">Table Name</label>
+                    <input type="text" name="table_name" class="form-inp" placeholder="Leave blank to use 'imported_data'"
+                           pattern="[a-zA-Z0-9_]*" title="Letters, numbers and underscores only">
+                    <div style="color:var(--text3);font-size:10.5px;margin-top:4px">Letters, numbers and underscores only. Leave blank for default.</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-lbl">CSV File *</label>
+                    <label class="drop-zone" id="drop-zone">
+                        <input type="file" name="csv_file" id="csv-file" accept=".csv" required onchange="onFileSelect(this)">
+                        <div class="drop-zone-ico">📁</div>
+                        <div class="drop-zone-txt">Click to choose a CSV file</div>
+                        <div class="drop-zone-sub">or drag and drop here</div>
+                        <div class="file-chosen" id="file-chosen"></div>
+                    </label>
+                </div>
+                <div style="display:flex;gap:10px;align-items:center">
+                    <button type="submit" class="btn btn-primary" id="submit-btn">⬆ Import CSV</button>
+                    <span id="importing-msg" style="display:none;color:var(--text3);font-size:12px"><span class="spinner" style="margin-right:6px"></span>Importing…</span>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <?php if (!empty($existing_tables)): ?>
+    <div class="card">
+        <div class="card-hdr" style="justify-content:space-between">
+            📋 Existing Tables
+            <a href="view-tables.php" class="btn btn-ghost btn-xs">Browse Data →</a>
+        </div>
+        <div class="card-body" style="padding:12px">
+            <div style="display:flex;flex-wrap:wrap;gap:6px">
+                <?php foreach ($existing_tables as $t): ?>
+                <a href="explorer.php?table=<?= urlencode($t) ?>" class="badge b-gray" style="font-size:11px;text-decoration:none;padding:4px 10px">
+                    📋 <?= htmlspecialchars($t) ?>
+                </a>
+                <?php endforeach; ?>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+</div>
+
+<script>
+function onFileSelect(input) {
+    const el = document.getElementById('file-chosen');
+    el.textContent = input.files[0]?.name || '';
+}
+document.getElementById('import-form').addEventListener('submit', function() {
+    document.getElementById('submit-btn').disabled = true;
+    document.getElementById('importing-msg').style.display = 'inline-flex';
+});
+const dz = document.getElementById('drop-zone');
+dz.addEventListener('dragover', e=>{ e.preventDefault(); dz.classList.add('drag-over'); });
+dz.addEventListener('dragleave', ()=>dz.classList.remove('drag-over'));
+dz.addEventListener('drop', e=>{
+    e.preventDefault(); dz.classList.remove('drag-over');
+    const f = e.dataTransfer.files[0];
+    if (f && f.name.endsWith('.csv')) {
+        const inp = document.getElementById('csv-file');
+        const dt = new DataTransfer(); dt.items.add(f); inp.files = dt.files;
+        document.getElementById('file-chosen').textContent = f.name;
+    }
+});
+</script>
+<?php page_footer(); ?>

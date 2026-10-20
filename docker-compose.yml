@@ -3,8 +3,15 @@ version: '3.8'
 services:
   php:
     build: ./php
+    environment:
+      DB_HOST: db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: appdb
+      PGCLIENT_CONFIG_DIR: /var/lib/pgclient
     volumes:
       - ./src:/var/www/html
+      - pgclient_config:/var/lib/pgclient
     depends_on:
       - db
     networks:
@@ -37,6 +44,7 @@ services:
 
 volumes:
   db_data:
+  pgclient_config:
 
 networks:
   app-network:
