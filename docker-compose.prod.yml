@@ -1,0 +1,59 @@
+# Production stack for a single VM. Used by deploy/vm-setup.sh; reads secrets from .env.
+# Differences from docker-compose.yml: Postgres is not published, credentials come from
+# .env, nginx listens on port 80 behind HTTP basic auth, and containers restart on reboot.
+name: php-postgres-app
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-db-env: &db-env
+  POSTGRES_DB: ${POSTGRES_DB:-appdb}
+  POSTGRES_USER: ${POSTGRES_USER:-app}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+
+services:
+  php:
+    build: ./php
+    restart: unless-stopped
+    environment:
+      <<: *db-env
+      DB_HOST: db
+    volumes:
+      - ./src:/var/www/html:ro
+      - ./php/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    logging: *logging
+
+  nginx:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./src:/var/www/html:ro
+      - ./nginx/nginx.prod.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
+    depends_on:
+      - php
+    logging: *logging
+
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment: *db-env
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+volumes:
+  db_data:
