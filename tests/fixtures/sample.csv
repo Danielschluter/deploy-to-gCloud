@@ -1,0 +1,5 @@
+id,name,zip,price,note
+1,Alice,02134,0.12345,"multi, line ""quoted"""
+2,Bob,94105,12.5,
+
+3,Carol,00501,1000,last

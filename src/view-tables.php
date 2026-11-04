@@ -1,113 +1,115 @@
 <?php
-require 'db.php';
+
+declare(strict_types=1);
+
+require __DIR__ . '/lib/db.php';
+require __DIR__ . '/lib/security.php';
+
+require_admin();
+send_page_headers();
+csrf_token();
 
 $pdo = get_db();
-$selected_table = '';
-$table_data = [];
-$columns = [];
 $message = '';
 $message_type = '';
+$all_tables = list_tables($pdo);
 
-// Fetch all tables
-$stmt = $pdo->query("
-    SELECT table_name FROM information_schema.tables 
-    WHERE table_schema = 'public' 
-    ORDER BY table_name
-");
-$all_tables = $stmt->fetchAll(PDO::FETCH_COLUMN);
-
-// Handle table selection and deletion
+// Row delete, clear table, drop table
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (isset($_POST['action']) && $_POST['action'] === 'delete_row') {
-        $table_to_delete = $_POST['table_name'] ?? '';
-        $row_id = $_POST['row_id'] ?? '';
-        
-        if ($table_to_delete && $row_id && in_array($table_to_delete, $all_tables)) {
-            try {
-                $delete_stmt = $pdo->prepare("DELETE FROM \"$table_to_delete\" WHERE id = ?");
-                $delete_stmt->execute([$row_id]);
-                $message = 'Row deleted successfully';
-                $message_type = 'success';
-            } catch (Exception $e) {
-                $message = 'Error deleting row: ' . htmlspecialchars($e->getMessage());
-                $message_type = 'error';
+    csrf_check();
+    $action = (string) ($_POST['action'] ?? '');
+    $target = (string) ($_POST['table_name'] ?? '');
+
+    if (!in_array($target, $all_tables, true)) {
+        $message = 'That table does not exist (any more).';
+        $message_type = 'error';
+    } else {
+        $q = quote_ident($target);
+        try {
+            switch ($action) {
+                case 'delete_row':
+                    $rowId = (string) ($_POST['row_id'] ?? '');
+                    if (!ctype_digit($rowId)) {
+                        throw new InvalidArgumentException('Invalid row id');
+                    }
+                    $stmt = $pdo->prepare("DELETE FROM $q WHERE id = ?");
+                    $stmt->execute([$rowId]);
+                    $message = $stmt->rowCount() ? 'Row deleted.' : 'That row was already deleted.';
+                    break;
+                case 'truncate_table':
+                    // No CASCADE: never silently empty other tables that reference this one.
+                    $pdo->exec("TRUNCATE TABLE $q RESTART IDENTITY");
+                    $message = "Table '$target' cleared.";
+                    break;
+                case 'drop_table':
+                    $pdo->exec("DROP TABLE $q");
+                    $message = "Table '$target' deleted.";
+                    $all_tables = list_tables($pdo);
+                    break;
+                default:
+                    throw new InvalidArgumentException('Unknown action');
             }
-        }
-    } elseif (isset($_POST['action']) && $_POST['action'] === 'truncate_table') {
-        $table_to_truncate = $_POST['table_name'] ?? '';
-        
-        if ($table_to_truncate && in_array($table_to_truncate, $all_tables)) {
-            try {
-                $pdo->exec("TRUNCATE TABLE \"$table_to_truncate\" RESTART IDENTITY CASCADE");
-                $message = "Table '$table_to_truncate' cleared successfully";
-                $message_type = 'success';
-                $selected_table = '';
-            } catch (Exception $e) {
-                $message = 'Error clearing table: ' . htmlspecialchars($e->getMessage());
-                $message_type = 'error';
-            }
-        }
-    } elseif (isset($_POST['action']) && $_POST['action'] === 'drop_table') {
-        $table_to_drop = $_POST['table_name'] ?? '';
-        
-        if ($table_to_drop && in_array($table_to_drop, $all_tables)) {
-            try {
-                $pdo->exec("DROP TABLE \"$table_to_drop\"");
-                $message = "Table '$table_to_drop' deleted successfully";
-                $message_type = 'success';
-                $selected_table = '';
-                // Refresh table list
-                $stmt = $pdo->query("
-                    SELECT table_name FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
-                    ORDER BY table_name
-                ");
-                $all_tables = $stmt->fetchAll(PDO::FETCH_COLUMN);
-            } catch (Exception $e) {
-                $message = 'Error dropping table: ' . htmlspecialchars($e->getMessage());
-                $message_type = 'error';
-            }
+            $message_type = 'success';
+        } catch (InvalidArgumentException $e) {
+            $message = $e->getMessage();
+            $message_type = 'error';
+        } catch (PDOException $e) {
+            error_log("view-tables $action on $target failed: " . $e->getMessage());
+            $message = 'Database error: ' . pg_error_summary($e);
+            $message_type = 'error';
         }
     }
 }
 
-// Load selected table data
-if (isset($_GET['table']) && in_array($_GET['table'], $all_tables)) {
-    $selected_table = $_GET['table'];
-    
+// Selected table
+$selected_table = '';
+$columns = [];
+$table_data = [];
+$has_id = false;
+$row_count = 0;
+$page = 1;
+$total_pages = 1;
+$requested = $_GET['table'] ?? '';
+
+if (is_string($requested) && in_array($requested, $all_tables, true)) {
+    $selected_table = $requested;
+    $q = quote_ident($selected_table);
+
     try {
-        // Get column information
-        $col_stmt = $pdo->query("
-            SELECT column_name, data_type 
-            FROM information_schema.columns 
-            WHERE table_name = '$selected_table'
-            ORDER BY ordinal_position
-        ");
+        $col_stmt = $pdo->prepare(
+            "SELECT column_name, data_type FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = ?
+             ORDER BY ordinal_position"
+        );
+        $col_stmt->execute([$selected_table]);
         $columns = $col_stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        // Get row count
-        $count_stmt = $pdo->query("SELECT COUNT(*) FROM \"$selected_table\"");
-        $row_count = $count_stmt->fetchColumn();
-        
-        // Pagination
+        // Rows can only be deleted one by one in tables with an "id" key (as the importer creates).
+        $has_id = in_array('id', array_column($columns, 'column_name'), true);
+
+        $row_count = (int) $pdo->query("SELECT COUNT(*) FROM $q")->fetchColumn();
         $per_page = 20;
-        $page = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
+        $total_pages = max(1, (int) ceil($row_count / $per_page));
+        $page = min($total_pages, max(1, (int) ($_GET['page'] ?? 1)));
         $offset = ($page - 1) * $per_page;
-        $total_pages = ceil($row_count / $per_page);
-        
-        // Get table data
-        $data_stmt = $pdo->query("
-            SELECT * FROM \"$selected_table\" 
-            ORDER BY id DESC
-            LIMIT $per_page OFFSET $offset
-        ");
-        $table_data = $data_stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-    } catch (Exception $e) {
-        $message = 'Error loading table: ' . htmlspecialchars($e->getMessage());
+        $order = $has_id ? 'ORDER BY id DESC' : '';
+
+        $table_data = $pdo->query("SELECT * FROM $q $order LIMIT $per_page OFFSET $offset")->fetchAll(PDO::FETCH_ASSOC);
+    } catch (PDOException $e) {
+        error_log("view-tables: loading $selected_table failed: " . $e->getMessage());
+        $message = 'Error loading table: ' . pg_error_summary($e);
         $message_type = 'error';
         $selected_table = '';
     }
+}
+
+/** Display form of a database value. */
+function cell(mixed $v): string
+{
+    return match (true) {
+        $v === null => '',
+        is_bool($v) => $v ? 'true' : 'false',
+        default => (string) $v,
+    };
 }
 ?>
 <!doctype html>
@@ -425,89 +427,17 @@ if (isset($_GET['table']) && in_array($_GET['table'], $all_tables)) {
         }
     </style>
     <script>
-        function openDeleteModal(tableName) {
-            document.getElementById('deleteModal').classList.add('show');
-            document.getElementById('deleteTableName').value = tableName;
-            document.getElementById('deleteAction').value = 'truncate_table';
+        function openModal(id) {
+            document.getElementById(id).classList.add('show');
         }
-        
-        function openDropModal(tableName) {
-            document.getElementById('dropModal').classList.add('show');
-            document.getElementById('dropTableName').value = tableName;
-            document.getElementById('dropAction').value = 'drop_table';
+        function closeModal(id) {
+            document.getElementById(id).classList.remove('show');
         }
-        
-        function closeModal(modalId) {
-            document.getElementById(modalId).classList.remove('show');
-        }
-        
-        function confirmDelete() {
-            const form = document.createElement('form');
-            form.method = 'POST';
-            
-            const tableInput = document.createElement('input');
-            tableInput.type = 'hidden';
-            tableInput.name = 'table_name';
-            tableInput.value = document.getElementById('deleteTableName').value;
-            
-            const actionInput = document.createElement('input');
-            actionInput.type = 'hidden';
-            actionInput.name = 'action';
-            actionInput.value = 'truncate_table';
-            
-            form.appendChild(tableInput);
-            form.appendChild(actionInput);
-            document.body.appendChild(form);
-            form.submit();
-        }
-        
-        function confirmDrop() {
-            const form = document.createElement('form');
-            form.method = 'POST';
-            
-            const tableInput = document.createElement('input');
-            tableInput.type = 'hidden';
-            tableInput.name = 'table_name';
-            tableInput.value = document.getElementById('dropTableName').value;
-            
-            const actionInput = document.createElement('input');
-            actionInput.type = 'hidden';
-            actionInput.name = 'action';
-            actionInput.value = 'drop_table';
-            
-            form.appendChild(tableInput);
-            form.appendChild(actionInput);
-            document.body.appendChild(form);
-            form.submit();
-        }
-        
-        function deleteRow(tableNum, rowId) {
-            if (!confirm('Are you sure you want to delete this row?')) return;
-            
-            const form = document.createElement('form');
-            form.method = 'POST';
-            
-            const tableInput = document.createElement('input');
-            tableInput.type = 'hidden';
-            tableInput.name = 'table_name';
-            tableInput.value = document.querySelector('.table-item.active').textContent;
-            
-            const rowInput = document.createElement('input');
-            rowInput.type = 'hidden';
-            rowInput.name = 'row_id';
-            rowInput.value = rowId;
-            
-            const actionInput = document.createElement('input');
-            actionInput.type = 'hidden';
-            actionInput.name = 'action';
-            actionInput.value = 'delete_row';
-            
-            form.appendChild(tableInput);
-            form.appendChild(rowInput);
-            form.appendChild(actionInput);
-            document.body.appendChild(form);
-            form.submit();
-        }
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') {
+                document.querySelectorAll('.modal.show').forEach(function (m) { m.classList.remove('show'); });
+            }
+        });
     </script>
   </head>
   <body>
@@ -536,8 +466,8 @@ if (isset($_GET['table']) && in_array($_GET['table'], $all_tables)) {
         
         <div class="main">
           <?php if ($message): ?>
-              <div class="alert <?php echo $message_type; ?>">
-                  <?php echo htmlspecialchars($message); ?>
+              <div class="alert <?= h($message_type) ?>">
+                  <?= h($message) ?>
               </div>
           <?php endif; ?>
           
@@ -563,10 +493,10 @@ if (isset($_GET['table']) && in_array($_GET['table'], $all_tables)) {
                   <?php endif; ?>
                 </div>
                 <div class="table-actions">
-                  <button class="btn btn-warning" onclick="openDeleteModal('<?php echo htmlspecialchars($selected_table); ?>')">
+                  <button class="btn btn-warning" onclick="openModal('deleteModal')">
                     🗑️ Clear Table
                   </button>
-                  <button class="btn btn-danger" onclick="openDropModal('<?php echo htmlspecialchars($selected_table); ?>')">
+                  <button class="btn btn-danger" onclick="openModal('dropModal')">
                     ❌ Delete Table
                   </button>
                 </div>
@@ -580,7 +510,9 @@ if (isset($_GET['table']) && in_array($_GET['table'], $all_tables)) {
                           <?php foreach ($columns as $col): ?>
                               <th><?php echo htmlspecialchars($col['column_name']); ?></th>
                           <?php endforeach; ?>
-                          <th style="width: 60px; text-align: center;">Action</th>
+                          <?php if ($has_id): ?>
+                              <th style="width: 60px; text-align: center;">Action</th>
+                          <?php endif; ?>
                         </tr>
                       </thead>
                       <tbody>
@@ -588,17 +520,22 @@ if (isset($_GET['table']) && in_array($_GET['table'], $all_tables)) {
                             <tr>
                               <?php foreach ($columns as $col): ?>
                                   <td>
-                                    <span class="cell-content" title="<?php echo htmlspecialchars($row[$col['column_name']] ?? ''); ?>">
-                                        <?php echo htmlspecialchars($row[$col['column_name']] ?? ''); ?>
+                                    <span class="cell-content" title="<?= h(cell($row[$col['column_name']] ?? null)) ?>">
+                                        <?= h(cell($row[$col['column_name']] ?? null)) ?>
                                     </span>
                                   </td>
                               <?php endforeach; ?>
-                              <td style="text-align: center;">
-                                <button class="btn-danger" style="padding: 4px 8px; font-size: 11px;" 
-                                        onclick="deleteRow(this, <?php echo $row['id']; ?>)">
-                                    Delete
-                                </button>
-                              </td>
+                              <?php if ($has_id): ?>
+                                  <td style="text-align: center;">
+                                    <form method="POST" onsubmit="return confirm('Delete this row?')">
+                                      <?= csrf_field() ?>
+                                      <input type="hidden" name="action" value="delete_row">
+                                      <input type="hidden" name="table_name" value="<?= h($selected_table) ?>">
+                                      <input type="hidden" name="row_id" value="<?= h(cell($row['id'])) ?>">
+                                      <button type="submit" class="btn-danger" style="padding: 4px 8px; font-size: 11px;">Delete</button>
+                                    </form>
+                                  </td>
+                              <?php endif; ?>
                             </tr>
                         <?php endforeach; ?>
                       </tbody>
@@ -640,32 +577,36 @@ if (isset($_GET['table']) && in_array($_GET['table'], $all_tables)) {
       </div>
     </div>
     
-    <!-- Delete/Truncate Modal -->
+    <?php if ($selected_table): ?>
+    <!-- Clear (truncate) table -->
     <div id="deleteModal" class="modal">
       <div class="modal-content">
         <h3>⚠️ Clear Table</h3>
-        <p>This will delete all rows from the table. This action cannot be undone.</p>
-        <input type="hidden" id="deleteTableName">
-        <input type="hidden" id="deleteAction">
-        <div class="modal-buttons">
-          <button class="btn-cancel" onclick="closeModal('deleteModal')">Cancel</button>
-          <button class="btn-confirm" onclick="confirmDelete()">Clear Table</button>
-        </div>
+        <p>This will delete all rows from <strong><?= h($selected_table) ?></strong>. This action cannot be undone.</p>
+        <form method="POST" class="modal-buttons">
+          <?= csrf_field() ?>
+          <input type="hidden" name="action" value="truncate_table">
+          <input type="hidden" name="table_name" value="<?= h($selected_table) ?>">
+          <button type="button" class="btn-cancel" onclick="closeModal('deleteModal')">Cancel</button>
+          <button type="submit" class="btn-confirm">Clear Table</button>
+        </form>
       </div>
     </div>
-    
-    <!-- Drop Table Modal -->
+
+    <!-- Drop table -->
     <div id="dropModal" class="modal">
       <div class="modal-content">
         <h3>❌ Delete Table</h3>
-        <p>This will permanently delete the entire table and all its data. This action cannot be undone.</p>
-        <input type="hidden" id="dropTableName">
-        <input type="hidden" id="dropAction">
-        <div class="modal-buttons">
-          <button class="btn-cancel" onclick="closeModal('dropModal')">Cancel</button>
-          <button class="btn-confirm" onclick="confirmDrop()">Delete Table</button>
-        </div>
+        <p>This will permanently delete <strong><?= h($selected_table) ?></strong> and all its data. This action cannot be undone.</p>
+        <form method="POST" class="modal-buttons">
+          <?= csrf_field() ?>
+          <input type="hidden" name="action" value="drop_table">
+          <input type="hidden" name="table_name" value="<?= h($selected_table) ?>">
+          <button type="button" class="btn-cancel" onclick="closeModal('dropModal')">Cancel</button>
+          <button type="submit" class="btn-confirm">Delete Table</button>
+        </form>
       </div>
     </div>
+    <?php endif; ?>
   </body>
 </html>

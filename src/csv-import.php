@@ -1,161 +1,61 @@
 <?php
-require 'db.php';
+
+declare(strict_types=1);
+
+require __DIR__ . '/lib/csv.php';
+require __DIR__ . '/lib/security.php';
+
+require_admin();
+send_page_headers();
+csrf_token();
 
 $message = '';
 $messageType = '';
-$uploaded_file = null;
+$result = null;
+$maxUpload = ini_get('upload_max_filesize');
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
-    $table_name = preg_replace('/[^a-zA-Z0-9_]/', '', $_POST['table_name'] ?? 'imported_data');
-    
-    if (empty($table_name)) {
-        $table_name = 'imported_data';
-    }
-    
-    $file = $_FILES['csv_file'];
-    
-    // Validate file upload
-    if ($file['error'] !== UPLOAD_ERR_OK) {
-        $message = 'File upload error: ' . $file['error'];
-        $messageType = 'error';
-    } elseif ($file['type'] !== 'text/csv' && pathinfo($file['name'], PATHINFO_EXTENSION) !== 'csv') {
-        $message = 'Please upload a valid CSV file';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (empty($_POST) && (int) ($_SERVER['CONTENT_LENGTH'] ?? 0) > 0) {
+        // PHP drops the whole body when it exceeds post_max_size.
+        $message = "The upload is too large. The limit is {$maxUpload}.";
         $messageType = 'error';
     } else {
+        csrf_check();
+        $file = $_FILES['csv_file'] ?? null;
+        $table = sanitize_table_name((string) ($_POST['table_name'] ?? ''));
+
         try {
-            $pdo = get_db();
-            $rows = [];
-            $headers = [];
-            
-            // Read CSV file
-            if (($handle = fopen($file['tmp_name'], 'r')) !== false) {
-                $row_num = 0;
-                while (($data = fgetcsv($handle, 1000, ',')) !== false) {
-                    if ($row_num === 0) {
-                        $headers = $data;
-                    } else {
-                        $rows[] = $data;
-                    }
-                    $row_num++;
-                }
-                fclose($handle);
+            if (!is_array($file) || !isset($file['error']) || is_array($file['error'])) {
+                throw new ImportError('Choose a CSV file to upload');
             }
-            
-            if (empty($headers)) {
-                throw new Exception('CSV file is empty');
+            if ($file['error'] !== UPLOAD_ERR_OK) {
+                throw new ImportError(match ($file['error']) {
+                    UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE => "The file is too large. The limit is {$maxUpload}.",
+                    UPLOAD_ERR_NO_FILE => 'Choose a CSV file to upload',
+                    default => 'The upload failed (error ' . (int) $file['error'] . '). Please try again.',
+                });
             }
-            
-            if (empty($rows)) {
-                throw new Exception('CSV file has no data rows');
+            if (strtolower(pathinfo((string) $file['name'], PATHINFO_EXTENSION)) !== 'csv') {
+                throw new ImportError('Please upload a file with a .csv extension');
             }
-            
-            // Sanitize column names
-            $clean_headers = array_map(function($header) {
-                return preg_replace('/[^a-zA-Z0-9_]/', '_', trim($header));
-            }, $headers);
-            
-            // Infer column types from first few rows
-            $types = [];
-            foreach ($clean_headers as $idx => $header) {
-                $types[$header] = 'TEXT'; // Default to TEXT
-                
-                // Check first 10 rows to infer type
-                $sample_rows = array_slice($rows, 0, min(10, count($rows)));
-                $all_numeric = true;
-                $all_integer = true;
-                
-                foreach ($sample_rows as $row) {
-                    $value = trim($row[$idx] ?? '');
-                    if ($value === '') continue;
-                    
-                    if (!is_numeric($value)) {
-                        $all_numeric = false;
-                        $all_integer = false;
-                    } elseif (strpos($value, '.') !== false) {
-                        // Contains a decimal point, so it's not an integer
-                        $all_integer = false;
-                    }
-                }
-                
-                if ($all_numeric) {
-                    $types[$header] = $all_integer ? 'INTEGER' : 'DECIMAL(15,2)';
-                }
-            }
-            
-            // Check if table exists
-            $table_exists_query = "
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = ?
-                )
-            ";
-            $stmt = $pdo->prepare($table_exists_query);
-            $stmt->execute([$table_name]);
-            $table_exists = $stmt->fetchColumn();
-            
-            // Create table if it doesn't exist
-            if (!$table_exists) {
-                $create_sql = "CREATE TABLE $table_name (id SERIAL PRIMARY KEY";
-                foreach ($clean_headers as $header) {
-                    $create_sql .= ", \"$header\" " . $types[$header];
-                }
-                $create_sql .= ")";
-                
-                $pdo->exec($create_sql);
-                $message = "Table '$table_name' created successfully. ";
-            } else {
-                $message = "Inserting data into existing table '$table_name'. ";
-            }
-            
-            // Insert data
-            $insert_sql = "INSERT INTO $table_name (";
-            $insert_sql .= implode(', ', array_map(fn($h) => "\"$h\"", $clean_headers));
-            $insert_sql .= ") VALUES (";
-            $insert_sql .= implode(', ', array_fill(0, count($clean_headers), '?'));
-            $insert_sql .= ")";
-            
-            $stmt = $pdo->prepare($insert_sql);
-            
-            $inserted = 0;
-            foreach ($rows as $row) {
-                $values = [];
-                foreach ($clean_headers as $idx => $header) {
-                    $value = trim($row[$idx] ?? '');
-                    $values[] = $value === '' ? null : $value;
-                }
-                $stmt->execute($values);
-                $inserted++;
-            }
-            
-            $message .= "Successfully inserted $inserted rows into '$table_name'.";
+
+            $result = import_csv(get_db(), $file['tmp_name'], $table);
+            $result['file'] = (string) $file['name'];
+            $message = ($result['created'] ? "Table '{$table}' created. " : "Added to existing table '{$table}'. ")
+                . "Inserted {$result['rows']} rows.";
             $messageType = 'success';
-            $uploaded_file = [
-                'name' => htmlspecialchars($file['name']),
-                'table' => htmlspecialchars($table_name),
-                'rows' => $inserted,
-                'headers' => $clean_headers
-            ];
-            
-        } catch (Exception $e) {
-            $message = 'Error: ' . htmlspecialchars($e->getMessage());
+        } catch (ImportError $e) {
+            $message = $e->getMessage();
+            $messageType = 'error';
+        } catch (PDOException $e) {
+            error_log('CSV import failed: ' . $e->getMessage());
+            $message = 'Database error: ' . pg_error_summary($e);
             $messageType = 'error';
         }
     }
 }
 
-// Fetch existing tables
-$existing_tables = [];
-try {
-    $pdo = get_db();
-    $stmt = $pdo->query("
-        SELECT table_name FROM information_schema.tables 
-        WHERE table_schema = 'public' 
-        ORDER BY table_name
-    ");
-    $existing_tables = $stmt->fetchAll(PDO::FETCH_COLUMN);
-} catch (Exception $e) {
-    // Silently fail
-}
+$existing_tables = list_tables(get_db());
 ?>
 <!doctype html>
 <html>
@@ -341,6 +241,15 @@ try {
             font-weight: 500;
             border: 1px solid #d4d9f5;
         }
+        .hint {
+            font-size: 12px;
+            color: #888;
+            margin-top: 6px;
+        }
+        a.table-item {
+            text-decoration: none;
+            display: block;
+        }
         .empty-state {
             text-align: center;
             color: #999;
@@ -367,15 +276,16 @@ try {
       
       <div class="content">
         <?php if ($message): ?>
-            <div class="alert <?php echo $messageType; ?>">
-                <?php echo $message; ?>
+            <div class="alert <?= h($messageType) ?>">
+                <?= h($message) ?>
             </div>
         <?php endif; ?>
         
         <form method="POST" enctype="multipart/form-data">
+          <?= csrf_field() ?>
           <div class="form-group">
             <label>Table Name (optional)</label>
-            <input type="text" name="table_name" placeholder="Leave blank for 'imported_data'" value="">
+            <input type="text" name="table_name" placeholder="Leave blank for 'imported_data'" value="" maxlength="63" pattern="[A-Za-z0-9_]*" title="Letters, digits and underscores">
           </div>
           
           <div class="form-group">
@@ -387,28 +297,31 @@ try {
               </div>
               <div class="file-name"></div>
             </label>
+            <p class="hint">First row must be the column names. Max size <?= h($maxUpload) ?>.</p>
           </div>
           
           <button type="submit">Import CSV</button>
         </form>
         
-        <?php if ($uploaded_file): ?>
+        <?php if ($result): ?>
             <div class="result">
               <h3>✅ Import Successful</h3>
-              <p><strong>File:</strong> <?php echo $uploaded_file['name']; ?></p>
-              <p><strong>Table:</strong> <?php echo $uploaded_file['table']; ?></p>
-              <p><strong>Rows Inserted:</strong> <?php echo $uploaded_file['rows']; ?></p>
+              <p><strong>File:</strong> <?= h($result['file']) ?></p>
+              <p><strong>Table:</strong> <a href="view-tables.php?table=<?= h(urlencode($result['table'])) ?>"><?= h($result['table']) ?></a></p>
+              <p><strong>Rows Inserted:</strong> <?= (int) $result['rows'] ?></p>
               <p><strong>Columns:</strong></p>
               <table>
                 <thead>
                   <tr>
                     <th>Column Name</th>
+                    <th>Type</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <?php foreach ($uploaded_file['headers'] as $header): ?>
+                  <?php foreach ($result['columns'] as $column => $type): ?>
                     <tr>
-                      <td><?php echo htmlspecialchars($header); ?></td>
+                      <td><?= h($column) ?></td>
+                      <td><?= h(strtolower($type)) ?></td>
                     </tr>
                   <?php endforeach; ?>
                 </tbody>
@@ -421,7 +334,7 @@ try {
               <h3>📋 Existing Tables</h3>
               <div class="table-list">
                 <?php foreach ($existing_tables as $table): ?>
-                    <div class="table-item"><?php echo htmlspecialchars($table); ?></div>
+                    <a class="table-item" href="view-tables.php?table=<?= h(urlencode($table)) ?>"><?= h($table) ?></a>
                 <?php endforeach; ?>
               </div>
             </div>
