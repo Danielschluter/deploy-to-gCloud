@@ -40,8 +40,8 @@ jobs:
           sql() { docker compose exec -T db psql -U user -d appdb -tAc "$1"; }
 
           curl -fsS $B/healthz
-          curl -fsS $B/ | grep -q 'connected'
-          curl -fsSI $B/ | grep -qi '^content-security-policy:'
+          curl -fsS $B/ | grep 'connected' > /dev/null
+          curl -fsSI $B/ | grep -i '^content-security-policy:' > /dev/null
 
           echo "Admin pages need the password"
           test "$(code $B/csv-import.php)" = 401
@@ -49,22 +49,22 @@ jobs:
 
           echo "Import needs a CSRF token"
           curl -fsS -c jar -u admin:ci-secret $B/csv-import.php > page.html
-          token=$(grep -o 'name="csrf" value="[a-f0-9]*"' page.html | head -1 | sed 's/.*value="//; s/"$//')
+          token=$(grep -m1 -o 'name="csrf" value="[a-f0-9]*"' page.html | sed 's/.*value="//; s/"$//')
           test -n "$token"
           test "$(code -b jar -u admin:ci-secret -F table_name=sample -F csv_file=@tests/fixtures/sample.csv $B/csv-import.php)" = 403
 
           echo "Import"
           curl -fsS -b jar -u admin:ci-secret -F csrf=$token -F table_name=sample \
-            -F csv_file=@tests/fixtures/sample.csv $B/csv-import.php | grep -q 'Inserted 3 rows'
+            -F csv_file=@tests/fixtures/sample.csv $B/csv-import.php | grep 'Inserted 3 rows' > /dev/null
           test "$(sql "select zip from sample where name = 'Alice'")" = 02134
           test "$(sql "select price from sample where name = 'Alice'")" = 0.12345
           test "$(sql 'select count(*) from sample')" = 3
 
           echo "Browse and delete a row"
-          curl -fsS -b jar -u admin:ci-secret "$B/view-tables.php?table=sample" | grep -q 'Carol'
+          curl -fsS -b jar -u admin:ci-secret "$B/view-tables.php?table=sample" | grep 'Carol' > /dev/null
           id=$(sql "select id from sample where name = 'Bob'")
           curl -fsS -b jar -u admin:ci-secret -F csrf=$token -F action=delete_row -F table_name=sample \
-            -F row_id=$id "$B/view-tables.php?table=sample" | grep -q 'Row deleted'
+            -F row_id=$id "$B/view-tables.php?table=sample" | grep 'Row deleted' > /dev/null
           test "$(sql 'select count(*) from sample')" = 2
 
           echo "Internal files are never served"
