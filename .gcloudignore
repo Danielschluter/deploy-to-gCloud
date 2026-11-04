@@ -1,0 +1,6 @@
+# Files left out of `gcloud run deploy --source .` uploads.
+.git
+.github
+.env
+.env.*
+tests/
